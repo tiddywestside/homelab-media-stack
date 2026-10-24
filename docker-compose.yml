@@ -1,0 +1,413 @@
+#  __  __          _ _         ____  _             _    
+# |  \/  | ___  __| (_) __ _  / ___|| |_ __ _  ___| | __
+# | |\/| |/ _ \/ _` | |/ _` | \___ \| __/ _` |/ __| |/ /
+# | |  | |  __/ (_| | | (_| |  ___) | || (_| | (__|   < 
+# |_|  |_|\___|\__,_|_|\__,_| |____/ \__\__,_|\___|_|\_\
+#
+#              DOCKER MEDIA STACK
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  gluetun:     # ----------- Gluetun (VPN) -----------
+    image: qmcgaw/gluetun:latest
+    container_name: gluetun
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    network_mode: bridge
+    ports:
+      - 8888:8888/tcp    # HTTP proxy
+      - 8388:8388/tcp    # Shadowsocks (TCP)
+      - 8388:8388/udp    # Shadowsocks (UDP)
+      - 8000:8000/tcp    # Gluetun HTTP control server
+      - 8080:8080        # Expose qbittorrent web UI
+      - 8765:80          # Speedtest
+      - 9696:9696        # Prowlarr
+      - 9191:9191        # Dispatcharr
+    volumes:
+      - ${CONFIG}/config/gluetun:/gluetun
+      - /lib/modules:/lib/modules:ro
+      - ${CONFIG}/config/gluetun/wireguard/77.conf:/gluetun/wireguard/wg0.conf  # WireGuard config
+    environment:
+      - TZ=${TZ}
+      - VPN_SERVICE_PROVIDER=custom  # Use custom WireGuard config
+      - VPN_TYPE=wireguard
+      - PUBLICIP_API_TOKEN=${ipinfo_token} # IP lookup API token
+      - PUBLICIP_API=ip2location
+      - PUBLICIP_ENABLED=yes
+      - HTTPPROXY=on                # Enable HTTP proxy
+      - HTTPPROXY_USER=${HTTPPROXY_USER}      # Proxy username
+      - HTTPPROXY_PASSWORD=${HTTPPROXY_PASSWORD}  # Proxy password
+      - HTTPPROXY_LOG=on            # Enable proxy logging
+      - FIREWALL_OUTBOUND_SUBNETS=${outbound_subnets}
+      - HTTP_CONTROL_SERVER_AUTH_CONFIG_FILEPATH=gluetun/config.toml
+    restart: unless-stopped
+    logging: *default-logging
+
+  qbittorrent: # ---------- qBittorrent --------------
+    image: lscr.io/linuxserver/qbittorrent:5.2.1-libtorrentv1
+    container_name: qbittorrent
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+      - WEBUI_PORT=8080
+    volumes:
+      - ${NFS}/data:/data
+      - ${CONFIG}/config/qbittorrent:/config
+      - ${CONFIG}/config/qbittorrent/scripts:/scripts #ntfy and cross-seed scripts
+      - ${CONFIG}/config/qbittorrent/webui:/webui #used to easily set a theme
+    healthcheck:
+      test: curl -fsS http://localhost:8080/api/v2/app/version || exit 1
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    network_mode: "service:gluetun"  # Route traffic through VPN
+    depends_on:
+      gluetun:
+        condition: service_healthy
+        restart: true
+    labels:
+      autoheal-app: true
+    logging: *default-logging
+
+  qbit_manage: # ---------- qbit_manage --------------
+    container_name: qbit_manage
+    image: bobokun/qbit_manage
+    volumes:
+      - ${CONFIG}/config/qbit_manage/:/config:rw
+      - ${NFS}/data/torrents:/data/torrents/:rw
+      - ${CONFIG}/config/qbittorrent/:/qbittorrent/:ro
+    environment:
+      - QBT_RUN=false
+      - QBT_SCHEDULE=10  # Run every 10 minutes
+      - QBT_CONFIG=config.yml
+      - QBT_LOGFILE=activity.log
+      - QBT_CROSS_SEED=false
+      - QBT_RECHECK=true
+      - QBT_CAT_UPDATE=false
+      - QBT_TAG_UPDATE=true
+      - QBT_REM_UNREGISTERED=true
+      - QBT_REM_ORPHANED=true
+      - QBT_TAG_TRACKER_ERROR=true
+      - QBT_TAG_NOHARDLINKS=true
+      - QBT_SHARE_LIMITS=true
+      - QBT_SKIP_CLEANUP=false
+      - QBT_DRY_RUN=false
+      - QBT_LOG_LEVEL=INFO
+      - QBT_DIVIDER==
+      - QBT_WIDTH=100
+      - VERIFY_WEBUI_CERTIFICATE=False
+    restart: on-failure:2
+    depends_on:
+      qbittorrent:
+        condition: service_started
+    logging: *default-logging
+
+  prowlarr:    # ----------- Prowlarr ----------------
+    image: ghcr.io/linuxserver/prowlarr:latest
+    container_name: prowlarr
+    restart: unless-stopped
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+    volumes:
+      - ${CONFIG}/config/prowlarr:/config
+    #ports:
+    #  - 9696:9696
+    network_mode: "service:gluetun"
+    depends_on:
+      gluetun:
+        condition: service_healthy
+        restart: false
+    logging: *default-logging
+
+  sonarr:      # ------------ Sonarr -----------------
+    container_name: sonarr
+    image: linuxserver/sonarr:develop
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - ${CONFIG}/config/sonarr:/config
+      - ${NFS}/data:/data
+    logging: *default-logging
+
+  sonarr4k:    # ----------- Sonarr4k ----------------
+    container_name: sonarr4k
+    image: linuxserver/sonarr:develop
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - ${CONFIG}/config/sonarr4k:/config
+      - ${NFS}/data:/data
+    logging: *default-logging
+
+  radarr:      # ------------ Radarr -----------------
+    container_name: radarr
+    image: linuxserver/radarr:latest
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - ${CONFIG}/config/radarr:/config
+      - ${NFS}/data:/data
+    logging: *default-logging
+
+  radarr4k:    # ----------- Radarr4k ----------------
+    container_name: radarr4k
+    image: linuxserver/radarr:latest
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - ${CONFIG}/config/radarr4k:/config
+      - ${NFS}/data:/data
+    logging: *default-logging
+
+  plex-server: # -------- Plex Media Server ----------
+    container_name: plex-server
+    image: lscr.io/linuxserver/plex:latest
+    runtime: nvidia  # Enable GPU for transcoding
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+    environment:
+      - TZ=${TZ}
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all
+    network_mode: host
+    volumes:
+      - ${CONFIG}/config/plex/db:/config
+      - ${NFS}/data:/data
+      - /tmp/plex:/transcode  # Temporary fast storage for transcodes
+    restart: unless-stopped
+    logging: *default-logging
+
+  tautulli:    # ----------- Tautulli ----------------
+    image: ghcr.io/tautulli/tautulli
+    container_name: tautulli
+    restart: unless-stopped
+    volumes:
+      - ${CONFIG}/config/tautulli:/config
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+      - PYTHONPATH=/config/scripts/python-libs
+    ports:
+      - 8181:8181
+    depends_on:
+      plex-server:
+        condition: service_started
+    logging: *default-logging
+
+  bazarr:      # ------------ Bazarr -----------------
+    container_name: bazarr
+    image: linuxserver/bazarr
+    restart: unless-stopped
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+      - UMASK=${UMASK}
+    volumes:
+      - ${CONFIG}/config/bazarr:/config
+      - ${NFS}/data:/data
+    ports:
+      - 6767:6767
+    logging: *default-logging
+
+  bazarr4k:    # ----------- Bazarr4k ----------------
+    container_name: bazarr4k
+    image: linuxserver/bazarr
+    restart: unless-stopped
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+      - UMASK=${UMASK}
+    volumes:
+      - ${CONFIG}/config/bazarr4k:/config
+      - ${NFS}/data:/data
+    ports:
+      - 6768:6767
+    logging: *default-logging
+
+  seerr:       # ------------- Serr ------------------
+    image: ghcr.io/seerr-team/seerr:latest
+    init: true
+    container_name: seerr
+    environment:
+      - LOG_LEVEL=none
+      - TZ=${TZ}
+      - TRUST_PROXY=1
+    ports:
+      - 5055:5055
+    volumes:
+      - ${CONFIG}/config/overseerr:/app/config
+    healthcheck:
+      test: wget --no-verbose --tries=1 --spider http://localhost:5055/api/v1/settings/public || exit 1
+      start_period: 20s
+      timeout: 3s
+      interval: 15s
+      retries: 3
+    restart: unless-stopped
+    logging: *default-logging
+
+  recyclarr:   # ---------- Recyclarr ----------------
+    image: ghcr.io/recyclarr/recyclarr:8
+    container_name: recyclarr
+    user: ${PUID}:${PGID}
+    volumes:
+      - ${CONFIG}/config/recyclarr:/config
+    environment:
+      - TZ=${TZ}
+    restart: unless-stopped
+    logging: *default-logging
+
+  cross-seed:  # ---------- Cross-seed ---------------
+    image: ghcr.io/cross-seed/cross-seed
+    container_name: cross-seed
+    user: ${PUID}:${PGID}
+    ports:
+      - "2468:2468"
+    volumes:
+      - ${CONFIG}/config/cross-seed:/config
+      - ${CONFIG}/config/qbittorrent/qBittorrent/BT_backup:/torrents:ro
+      - ${NFS}/data/torrents/cross-seeds:/cross-seeds
+      - ${NFS}/data/torrents:/data
+    command: daemon
+    restart: unless-stopped
+    depends_on:
+      prowlarr:
+        condition: service_started
+    logging: *default-logging
+
+  unpackerr:   # ---------- Unpackerr ----------------
+    image: golift/unpackerr
+    container_name: unpackerr
+    user: ${PUID}:${PGID}
+    volumes:
+      - ${NFS}/data/torrents:/data/torrents
+      - ${CONFIG}/config/unpackerr:/config
+    restart: unless-stopped
+    environment:
+      - TZ=${TZ}
+      # General settings
+      - UN_DEBUG=false
+      - UN_INTERVAL=2m
+      - UN_START_DELAY=1m
+      - UN_RETRY_DELAY=5m
+      - UN_MAX_RETRIES=3
+      - UN_PARALLEL=1
+      # Sonarr settings (HD & 4K)
+      - UN_SONARR_0_URL=${sonarr_url}
+      - UN_SONARR_0_API_KEY=${sonarr_api}
+      - UN_SONARR_0_PATHS_0=/data/torrents
+      - UN_SONARR_0_PROTOCOLS=torrent
+      - UN_SONARR_1_URL=${sonarr4k_url}
+      - UN_SONARR_1_API_KEY=${sonarr4k_api}
+      - UN_SONARR_1_PATHS_0=/data/torrents
+      - UN_SONARR_1_PROTOCOLS=torrent
+      # Radarr settings (HD & 4K)
+      - UN_RADARR_0_URL=${radarr_url}
+      - UN_RADARR_0_API_KEY=${radarr_api}
+      - UN_RADARR_0_PATHS_0=/data/torrents
+      - UN_RADARR_0_PROTOCOLS=torrent
+      - UN_RADARR_1_URL=${radarr4k_url}
+      - UN_RADARR_1_API_KEY=${radarr4k_api}
+      - UN_RADARR_1_PATHS_0=/data/torrents
+      - UN_RADARR_1_PROTOCOLS=torrent
+      # Folder monitor
+      - UN_FOLDER_0_PATH=/config
+    logging: *default-logging
+
+  speedtest:   # ---------- Speedtest ----------------
+    container_name: speedtest
+    image: lscr.io/linuxserver/speedtest-tracker:latest
+    environment:
+      - TZ=${TZ}
+      - PGID=${PGID}
+      - PUID=${PUID}
+      - DB_CONNECTION=sqlite
+      - APP_KEY=${speedtest_appkey}
+      - SPEEDTEST_SCHEDULE=0 */12 * * *  # every 12 hours
+      - DISPLAY_TIMEZONE=${TZ}
+    volumes:
+      - ${CONFIG}/config/speedtest:/config
+    restart: unless-stopped
+    network_mode: "service:gluetun"
+    depends_on:
+      gluetun:
+        condition: service_healthy
+        restart: true
+    logging: *default-logging
+
+
+#  dispatcharr:   # ---------- Dispatcharr ----------------
+#    image: ghcr.io/dispatcharr/dispatcharr:latest
+#    restart: unless-stopped
+#    container_name: dispatcharr
+#    runtime: nvidia
+#    volumes:
+#      - ${CONFIG}/config/dispatcharr:/data
+#    environment:
+#      - TZ=${TZ}
+#      - PGID=${PGID}
+#      - PUID=${PUID}
+#      - DISPATCHARR_ENV=aio
+#      - REDIS_HOST=localhost
+#      - CELERY_BROKER_URL=redis://localhost:6379/0
+#      - DISPATCHARR_LOG_LEVEL=info
+#      - NVIDIA_VISIBLE_DEVICES=all
+#      - NVIDIA_DRIVER_CAPABILITIES=all
+#    network_mode: "service:gluetun"
+#    depends_on:
+#      gluetun:
+#        condition: service_healthy
+#        restart: true
+#    cap_add:
+#      - SYS_NICE
+#    logging: *default-logging
+
+  autoheal:    # ----------- Autoheal -----------------
+    image: willfarrell/autoheal
+    container_name: autoheal
+    restart: unless-stopped
+    environment:
+      - AUTOHEAL_CONTAINER_LABEL=autoheal-app
+      - AUTOHEAL_INTERVAL=30
+      - AUTOHEAL_START_PERIOD=60
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    logging: *default-logging
