@@ -1,0 +1,374 @@
+#  __  __          _ _         ____  _             _
+# |  \/  | ___  __| (_) __ _  / ___|| |_ __ _  ___| | __
+# | |\/| |/ _ \/ _` | |/ _` | \___ \| __/ _` |/ __| |/ /
+# | |  | |  __/ (_| | | (_| |  ___) | || (_| | (__|   <
+# |_|  |_|\___|\__,_|_|\__,_| |____/ \__\__,_|\___|_|\_\
+#
+#              DOCKER MEDIA STACK
+
+# ============================ Shared fragments ============================
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+# Defaults applied to every service
+x-base: &base
+  restart: unless-stopped
+  logging: *default-logging
+
+# Standard user/timezone environment (linuxserver.io style)
+x-env: &env
+  PUID: ${PUID}
+  PGID: ${PGID}
+  TZ: ${TZ}
+
+# Route a service's traffic through the Gluetun VPN container.
+# Ports for these services are published on gluetun.
+x-vpn: &vpn
+  network_mode: "service:gluetun"
+  depends_on:
+    gluetun:
+      condition: service_healthy
+      restart: true
+
+# Sonarr / Radarr instances (host networking, shared media path)
+x-arr: &arr
+  <<: *base
+  network_mode: host
+  environment:
+    <<: *env
+
+# ================================ Services ================================
+
+services:
+  # ------------------------------ VPN ------------------------------------
+
+  gluetun:
+    <<: *base
+    image: qmcgaw/gluetun:latest
+    container_name: gluetun
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    network_mode: bridge
+    ports:
+      - 8888:8888/tcp    # HTTP proxy
+      - 8388:8388/tcp    # Shadowsocks (TCP)
+      - 8388:8388/udp    # Shadowsocks (UDP)
+      - 8000:8000/tcp    # Gluetun HTTP control server
+      - 8080:8080        # qBittorrent web UI
+      - 8765:80          # Speedtest
+      - 9696:9696        # Prowlarr
+      # - 9191:9191      # Dispatcharr (uncomment with the service below)
+    volumes:
+      - ${CONFIG}/config/gluetun:/gluetun
+      - /lib/modules:/lib/modules:ro
+      - ${CONFIG}/config/gluetun/wireguard/77.conf:/gluetun/wireguard/wg0.conf  # WireGuard config
+    environment:
+      TZ: ${TZ}
+      VPN_SERVICE_PROVIDER: custom      # Use custom WireGuard config
+      VPN_TYPE: wireguard
+      PUBLICIP_API_TOKEN: ${ipinfo_token}  # IP lookup API token
+      PUBLICIP_API: ip2location
+      PUBLICIP_ENABLED: "yes"
+      HTTPPROXY: "on"                   # Enable HTTP proxy
+      HTTPPROXY_USER: ${HTTPPROXY_USER}
+      HTTPPROXY_PASSWORD: ${HTTPPROXY_PASSWORD}
+      HTTPPROXY_LOG: "on"               # Enable proxy logging
+      FIREWALL_OUTBOUND_SUBNETS: ${outbound_subnets}
+      HTTP_CONTROL_SERVER_AUTH_CONFIG_FILEPATH: gluetun/config.toml
+
+  # --------------------------- Downloads ---------------------------------
+
+  qbittorrent:
+    <<: [*base, *vpn]
+    image: lscr.io/linuxserver/qbittorrent:5.2.1-libtorrentv1
+    container_name: qbittorrent
+    environment:
+      <<: *env
+      WEBUI_PORT: "8080"
+    volumes:
+      - ${NFS}/data:/data
+      - ${CONFIG}/config/qbittorrent:/config
+      - ${CONFIG}/config/qbittorrent/scripts:/scripts  # ntfy and cross-seed scripts
+      - ${CONFIG}/config/qbittorrent/webui:/webui      # used to easily set a theme
+    healthcheck:
+      test: curl -fsS http://localhost:8080/api/v2/app/version || exit 1
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    labels:
+      autoheal-app: true
+
+  qbit_manage:
+    <<: *base
+    image: bobokun/qbit_manage
+    container_name: qbit_manage
+    restart: on-failure:2
+    volumes:
+      - ${CONFIG}/config/qbit_manage/:/config:rw
+      - ${NFS}/data/torrents:/data/torrents/:rw
+      - ${CONFIG}/config/qbittorrent/:/qbittorrent/:ro
+    environment:
+      QBT_RUN: "false"
+      QBT_SCHEDULE: "10"  # Run every 10 minutes
+      QBT_CONFIG: config.yml
+      QBT_LOGFILE: activity.log
+      QBT_CROSS_SEED: "false"
+      QBT_RECHECK: "true"
+      QBT_CAT_UPDATE: "false"
+      QBT_TAG_UPDATE: "true"
+      QBT_REM_UNREGISTERED: "true"
+      QBT_REM_ORPHANED: "true"
+      QBT_TAG_TRACKER_ERROR: "true"
+      QBT_TAG_NOHARDLINKS: "true"
+      QBT_SHARE_LIMITS: "true"
+      QBT_SKIP_CLEANUP: "false"
+      QBT_DRY_RUN: "false"
+      QBT_LOG_LEVEL: INFO
+      QBT_DIVIDER: "="
+      QBT_WIDTH: "100"
+      VERIFY_WEBUI_CERTIFICATE: "False"
+    depends_on:
+      qbittorrent:
+        condition: service_started
+
+  cross-seed:
+    <<: *base
+    image: ghcr.io/cross-seed/cross-seed
+    container_name: cross-seed
+    user: ${PUID}:${PGID}
+    command: daemon
+    ports:
+      - "2468:2468"
+    volumes:
+      - ${CONFIG}/config/cross-seed:/config
+      - ${CONFIG}/config/qbittorrent/qBittorrent/BT_backup:/torrents:ro
+      - ${NFS}/data/torrents/cross-seeds:/cross-seeds
+    depends_on:
+      prowlarr:
+        condition: service_started
+
+  unpackerr:
+    <<: *base
+    image: golift/unpackerr
+    container_name: unpackerr
+    user: ${PUID}:${PGID}
+    volumes:
+      - ${NFS}/data/torrents:/data/torrents
+      - ${CONFIG}/config/unpackerr:/config
+    environment:
+      TZ: ${TZ}
+      # General settings
+      UN_DEBUG: "false"
+      UN_INTERVAL: 2m
+      UN_START_DELAY: 1m
+      UN_RETRY_DELAY: 5m
+      UN_MAX_RETRIES: "3"
+      UN_PARALLEL: "1"
+      # Sonarr (HD & 4K)
+      UN_SONARR_0_URL: ${sonarr_url}
+      UN_SONARR_0_API_KEY: ${sonarr_api}
+      UN_SONARR_0_PATHS_0: /data/torrents
+      UN_SONARR_0_PROTOCOLS: torrent
+      UN_SONARR_1_URL: ${sonarr4k_url}
+      UN_SONARR_1_API_KEY: ${sonarr4k_api}
+      UN_SONARR_1_PATHS_0: /data/torrents
+      UN_SONARR_1_PROTOCOLS: torrent
+      # Radarr (HD & 4K)
+      UN_RADARR_0_URL: ${radarr_url}
+      UN_RADARR_0_API_KEY: ${radarr_api}
+      UN_RADARR_0_PATHS_0: /data/torrents
+      UN_RADARR_0_PROTOCOLS: torrent
+      UN_RADARR_1_URL: ${radarr4k_url}
+      UN_RADARR_1_API_KEY: ${radarr4k_api}
+      UN_RADARR_1_PATHS_0: /data/torrents
+      UN_RADARR_1_PROTOCOLS: torrent
+      # Folder monitor
+      UN_FOLDER_0_PATH: /config
+
+  # ------------------------ Indexers & *arrs -----------------------------
+
+  prowlarr:
+    <<: [*base, *vpn]
+    image: ghcr.io/linuxserver/prowlarr:latest
+    container_name: prowlarr
+    environment:
+      <<: *env
+    volumes:
+      - ${CONFIG}/config/prowlarr:/config
+
+  sonarr:
+    <<: *arr
+    image: linuxserver/sonarr:develop
+    container_name: sonarr
+    volumes:
+      - ${CONFIG}/config/sonarr:/config
+      - ${NFS}/data:/data
+
+  sonarr4k:
+    <<: *arr
+    image: linuxserver/sonarr:develop
+    container_name: sonarr4k
+    volumes:
+      - ${CONFIG}/config/sonarr4k:/config
+      - ${NFS}/data:/data
+
+  radarr:
+    <<: *arr
+    image: linuxserver/radarr:latest
+    container_name: radarr
+    volumes:
+      - ${CONFIG}/config/radarr:/config
+      - ${NFS}/data:/data
+
+  radarr4k:
+    <<: *arr
+    image: linuxserver/radarr:latest
+    container_name: radarr4k
+    volumes:
+      - ${CONFIG}/config/radarr4k:/config
+      - ${NFS}/data:/data
+
+  bazarr:
+    <<: *base
+    image: linuxserver/bazarr
+    container_name: bazarr
+    environment:
+      <<: *env
+      UMASK: ${UMASK}
+    ports:
+      - 6767:6767
+    volumes:
+      - ${CONFIG}/config/bazarr:/config
+      - ${NFS}/data:/data
+
+  bazarr4k:
+    <<: *base
+    image: linuxserver/bazarr
+    container_name: bazarr4k
+    environment:
+      <<: *env
+      UMASK: ${UMASK}
+    ports:
+      - 6768:6767
+    volumes:
+      - ${CONFIG}/config/bazarr4k:/config
+      - ${NFS}/data:/data
+
+  recyclarr:
+    <<: *base
+    image: ghcr.io/recyclarr/recyclarr:8
+    container_name: recyclarr
+    user: ${PUID}:${PGID}
+    environment:
+      TZ: ${TZ}
+    volumes:
+      - ${CONFIG}/config/recyclarr:/config
+
+  # ---------------------------- Media ------------------------------------
+
+  plex-server:
+    <<: *base
+    image: lscr.io/linuxserver/plex:latest
+    container_name: plex-server
+    runtime: nvidia  # Enable GPU for transcoding
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+    network_mode: host
+    environment:
+      TZ: ${TZ}
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: all
+    volumes:
+      - ${CONFIG}/config/plex/db:/config
+      - ${NFS}/data:/data
+      - /tmp/plex:/transcode  # Temporary fast storage for transcodes
+
+  tautulli:
+    <<: *base
+    image: ghcr.io/tautulli/tautulli
+    container_name: tautulli
+    environment:
+      <<: *env
+      PYTHONPATH: /config/scripts/python-libs
+    ports:
+      - 8181:8181
+    volumes:
+      - ${CONFIG}/config/tautulli:/config
+    depends_on:
+      plex-server:
+        condition: service_started
+
+  seerr:
+    <<: *base
+    image: ghcr.io/seerr-team/seerr:latest
+    container_name: seerr
+    init: true
+    environment:
+      LOG_LEVEL: none
+      TZ: ${TZ}
+      TRUST_PROXY: "1"
+    ports:
+      - 5055:5055
+    volumes:
+      - ${CONFIG}/config/overseerr:/app/config
+    healthcheck:
+      test: wget --no-verbose --tries=1 --spider http://localhost:5055/api/v1/settings/public || exit 1
+      start_period: 20s
+      timeout: 3s
+      interval: 15s
+      retries: 3
+
+  # --------------------------- Utilities ---------------------------------
+
+  speedtest:
+    <<: [*base, *vpn]
+    image: lscr.io/linuxserver/speedtest-tracker:latest
+    container_name: speedtest
+    environment:
+      <<: *env
+      DB_CONNECTION: sqlite
+      APP_KEY: ${speedtest_appkey}
+      SPEEDTEST_SCHEDULE: "0 */12 * * *"  # every 12 hours
+      DISPLAY_TIMEZONE: ${TZ}
+    volumes:
+      - ${CONFIG}/config/speedtest:/config
+
+  autoheal:
+    <<: *base
+    image: willfarrell/autoheal
+    container_name: autoheal
+    environment:
+      AUTOHEAL_CONTAINER_LABEL: autoheal-app
+      AUTOHEAL_INTERVAL: "30"
+      AUTOHEAL_START_PERIOD: "60"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  # dispatcharr:  # disabled — also uncomment port 9191 on gluetun
+  #   <<: [*base, *vpn]
+  #   image: ghcr.io/dispatcharr/dispatcharr:latest
+  #   container_name: dispatcharr
+  #   runtime: nvidia
+  #   cap_add:
+  #     - SYS_NICE
+  #   environment:
+  #     <<: *env
+  #     DISPATCHARR_ENV: aio
+  #     REDIS_HOST: localhost
+  #     CELERY_BROKER_URL: redis://localhost:6379/0
+  #     DISPATCHARR_LOG_LEVEL: info
+  #     NVIDIA_VISIBLE_DEVICES: all
+  #     NVIDIA_DRIVER_CAPABILITIES: all
+  #   volumes:
+  #     - ${CONFIG}/config/dispatcharr:/data
